@@ -1,18 +1,16 @@
 #!/usr/bin/env bash
-# 系统包管理器镜像优化模块
-# 支持 Debian 系、RHEL 系、国产发行版等
-# 多语言支持（中文/英文）
 # Module: system_mirror
-# Description: System Package Manager Mirror Optimization
-# Description(zh): 系统包管理器镜像优化
+# Description: System Package Manager Mirror Optimization (Global Mirrors)
+# Description(zh): 系统包管理器镜像优化（全球镜像源）
 
-# 初始化语言（从环境变量或参数获取，稍后在主脚本设置）
-LANG_ZH=false
-if [[ "${DEVBOOST_LANG}" == "zh_CN" || "${DEVBOOST_LANG}" == "zh" ]]; then
+# 初始化语言
+if [[ "${DEVBOOST_LANG}" == "zh" ]]; then
     LANG_ZH=true
+else
+    LANG_ZH=false
 fi
 
-# 输出函数（支持中英文）
+# 输出函数
 _echo() {
     local en="$1"
     local zh="$2"
@@ -23,11 +21,8 @@ _echo() {
     fi
 }
 
-# 获取发行版信息（复用 detect.sh 中的 OS_NAME, OS_VERSION）
-# 获取完整版本号、代号
-get_distro_info() {
-    # 已经由 detect.sh 设置了 OS_NAME, OS_VERSION
-    # 尝试获取代号
+# 获取发行版代号
+get_distro_codename() {
     local codename=""
     if [[ -f /etc/os-release ]]; then
         . /etc/os-release
@@ -36,74 +31,33 @@ get_distro_info() {
     if [[ -z "$codename" ]] && command -v lsb_release >/dev/null 2>&1; then
         codename=$(lsb_release -cs 2>/dev/null)
     fi
+    if [[ -z "$codename" ]]; then
+        _echo "Unable to get distribution codename, please input manually:" "无法获取发行版代号，请手动输入："
+        read -rp "> " codename
+    fi
     echo "$codename"
 }
 
-# 镜像源列表定义（按发行版分类）
-# 格式：镜像名称|URL模板（使用占位符 {protocol} {mirror} {distro_path} {branch} {codename} {components}）
-# 注意：URL模板根据发行版不同而不同，此处仅为示例，实际生成时根据发行版填充
-declare -A MIRROR_SOURCES
-
-# 通用占位符说明：
-# {protocol} - http 或 https
-# {mirror} - 镜像站域名
-# {distro_path} - 发行版在镜像站上的路径，如 ubuntu, debian, fedora, centos 等
-# {branch} - 仓库分支，如 stable, updates, security, backports 等
-# {codename} - 发行版代号
-# {components} - 组件列表，如 main, contrib, non-free
-
-# 定义镜像站列表（按地区分组，便于后续选择）
-declare -A MIRROR_STATIONS=(
-    # 中国大陆
-    ["aliyun"]="mirrors.aliyun.com"
-    ["tuna"]="mirrors.tuna.tsinghua.edu.cn"
-    ["ustc"]="mirrors.ustc.edu.cn"
-    ["huawei"]="mirrors.huaweicloud.com"
-    ["tencent"]="mirrors.tencent.com"
-    ["netease"]="mirrors.163.com"
-    ["sjtu"]="mirrors.sjtug.sjtu.edu.cn"
-    ["lzu"]="mirror.lzu.edu.cn"
-    ["bfsu"]="mirrors.bfsu.edu.cn"
-    ["bjtu"]="mirror.bjtu.edu.cn"
-    ["cqu"]="mirrors.cqu.edu.cn"
-    # 海外
-    ["mit"]="mirrors.mit.edu"
-    ["princeton"]="mirror.math.princeton.edu/pub"
-    ["columbia"]="mirror.cc.columbia.edu"
-    ["bu"]="mirrors.bu.edu"
-    ["ubc"]="mirror.it.ubc.ca"
-    ["ufscar"]="mirror.ufscar.br"
-    ["unlp"]="mirrors.unlp.edu.ar"
-    ["au"]="mirror.aarnet.edu.au"
-    ["nz"]="mirror.waikato.ac.nz"
-    ["kenet"]="kenet.ke"
-    ["sun"]="mirror.sun.ac.za"
-    ["heanet"]="ftp.heanet.ie"
-    ["switch"]="mirror.switch.ch"
-    ["sanger"]="mirror.sanger.ac.uk"
-    # 官方源
-    ["official"]=""
-)
-
-# 根据发行版获取默认组件
+# 获取默认组件
 get_default_components() {
     case "$OS_NAME" in
-        debian|ubuntu|linuxmint|raspbian|zorin|deepin|kalilinux|proxmox|armbian|openkylin)
+        debian|ubuntu|linuxmint|raspbian|zorin|deepin|kalilinux)
             if [[ "$OS_NAME" == "debian" ]]; then
                 echo "main contrib non-free"
             elif [[ "$OS_NAME" == "ubuntu" ]]; then
                 echo "main restricted universe multiverse"
             else
-                # 默认为 main
                 echo "main"
             fi
             ;;
         rhel|centos|rocky|almalinux|oraclelinux|fedora)
-            # RHEL 系使用 baseos, appstream 等，需要单独处理
             echo "baseos appstream"
             ;;
         openeuler|opencloudos)
             echo "OS"
+            ;;
+        arch)
+            echo "main"
             ;;
         *)
             echo "main"
@@ -111,285 +65,449 @@ get_default_components() {
     esac
 }
 
-# 生成 Debian/Ubuntu 系 sources.list
-generate_debian_like_sources() {
-    local mirror="$1"
-    local protocol="$2"
-    local codename="$3"
-    local components="$4"
-    local extra_branches=("${@:5}")   # 额外分支如 updates, security, backports
+# ==================================================
+# 全球镜像源数据库（按大洲/国家分类）
+# 格式：地区|国家|镜像站名称|域名|支持的协议|备注
+# ==================================================
 
-    local distro_path
-    case "$OS_NAME" in
-        debian) distro_path="debian" ;;
-        ubuntu) distro_path="ubuntu" ;;
-        linuxmint) distro_path="ubuntu" ;;  # Mint 基于 Ubuntu，但可能需要特殊处理
-        raspbian) distro_path="raspbian" ;;
-        *) distro_path="$OS_NAME" ;;
-    esac
+# 亚洲（中国）
+declare -a MIRRORS_ASIA_CHINA=(
+    "中国|阿里云|mirrors.aliyun.com|https/http|官方云镜像"
+    "中国|清华大学|mirrors.tuna.tsinghua.edu.cn|https/http|教育网"
+    "中国|中科大|mirrors.ustc.edu.cn|https/http|教育网"
+    "中国|华为云|mirrors.huaweicloud.com|https/http|官方云镜像"
+    "中国|腾讯云|mirrors.tencent.com|https/http|官方云镜像"
+    "中国|网易|mirrors.163.com|https/http|商业镜像"
+    "中国|搜狐|mirrors.sohu.com|https/http|商业镜像"
+    "中国|阿里云（杭州）|mirrors.aliyuncs.com|https/http|内网加速"
+    "中国|腾讯云（北京）|mirrors.tencentyun.com|https/http|内网加速"
+    "中国|华为云（北京）|mirrors.huaweicloud.com|https/http|内网加速"
+    "中国|上海交大|mirrors.sjtug.sjtu.edu.cn|https/http|教育网"
+    "中国|北京大学|mirrors.pku.edu.cn|https/http|教育网"
+    "中国|北京外国语大学|mirrors.bfsu.edu.cn|https/http|教育网"
+    "中国|北京交通大学|mirror.bjtu.edu.cn|https/http|教育网"
+    "中国|兰州大学|mirror.lzu.edu.cn|https/http|教育网"
+    "中国|重庆大学|mirrors.cqu.edu.cn|https/http|教育网"
+    "中国|南方科技大学|mirrors.sustech.edu.cn|https/http|教育网"
+    "中国|大连理工大学|mirror.dlut.edu.cn|https/http|教育网"
+    "中国|东北大学|mirror.neu.edu.cn|https/http|教育网"
+    "中国|浙江大学|mirrors.zju.edu.cn|https/http|教育网"
+    "中国|中国移动|mirrors.163.com|https/http|运营商"
+    "中国|中国电信|mirrors.aliyun.com|https/http|运营商"
+)
 
-    local base_url="${protocol}://${mirror}/${distro_path}"
-    local sources=""
+# 亚洲（其他国家和地区）
+declare -a MIRRORS_ASIA_OTHER=(
+    "日本|京都大学|ftp.iij.ad.jp|https/http|教育网"
+    "日本|筑波大学|ftp.tsukuba.wide.ad.jp|https/http|教育网"
+    "日本|RIKEN|ftp.riken.jp|https/http|研究机构"
+    "日本|JAIST|ftp.jaist.ac.jp|https/http|教育网"
+    "韩国|KAIST|ftp.kaist.ac.kr|https/http|教育网"
+    "韩国|Harukasan|mirror.kakao.com|https/http|商业镜像"
+    "新加坡|NUS|downloads.nus.edu.sg|https/http|教育网"
+    "新加坡|Singtel|mirror.singtel.com|https/http|运营商"
+    "新加坡|DigitalOcean|mirror.digitalocean.com|https/http|云服务"
+    "台湾|中央大学|ftp.yzu.edu.tw|https/http|教育网"
+    "台湾|中华电信|mirror.hinet.net|https/http|运营商"
+    "台湾|OSS Planet|mirror.ossplanet.net|https/http|社区镜像"
+    "香港|HKIX|mirror.hkix.net|https/http|交换中心"
+    "香港|CUHK|ftp.cuhk.edu.hk|https/http|教育网"
+    "香港|HKU|ftp.hku.hk|https/http|教育网"
+    "印度|IIT Madras|mirrors.iitm.ac.in|https/http|教育网"
+    "印度|IIT Bombay|mirrors.iitb.ac.in|https/http|教育网"
+    "越南|FPT|mirrors.fpt.vn|https/http|商业镜像"
+    "泰国|Nectec|mirror.nectec.or.th|https/http|研究机构"
+    "马来西亚|UM|mirror.um.edu.my|https/http|教育网"
+    "印度尼西亚|UI|mirror.ui.ac.id|https/http|教育网"
+)
 
-    # 主分支
-    sources+="deb ${base_url} ${codename} ${components}\n"
+# 欧洲
+declare -a MIRRORS_EUROPE=(
+    "德国|柏林自由大学|ftp.fu-berlin.de|https/http|教育网"
+    "德国|马克思普朗克研究所|ftp.mpi-inf.mpg.de|https/http|研究机构"
+    "德国|Hetzner|mirror.hetzner.de|https/http|商业镜像"
+    "英国|UK FAST|www.mirrorservice.org|https/http|社区镜像"
+    "英国|Imperial College|ftp.doc.ic.ac.uk|https/http|教育网"
+    "英国|Lancaster University|mirror.lancs.ac.uk|https/http|教育网"
+    "法国|IRISA|ftp.irisa.fr|https/http|研究机构"
+    "法国|CERN|mirror.cern.ch|https/http|研究机构"
+    "法国|Obelink|ftp.obelink.fr|https/http|商业镜像"
+    "荷兰|NLUUG|ftp.nluug.nl|https/http|社区镜像"
+    "荷兰|Surfnet|ftp.surfnet.nl|https/http|教育网"
+    "荷兰|Leiden University|mirror.leidenuniv.nl|https/http|教育网"
+    "瑞典|Lund University|ftp.lu.se|https/http|教育网"
+    "瑞典|Uppsala University|ftp.uu.se|https/http|教育网"
+    "瑞典|Sunet|ftp.sunet.se|https/http|教育网"
+    "瑞士|SWITCH|mirror.switch.ch|https/http|教育网"
+    "瑞士|ETH Zurich|mirror.ethz.ch|https/http|教育网"
+    "意大利|GARR|mirror.garr.it|https/http|教育网"
+    "意大利|INAF|mirrors.inaf.it|https/http|研究机构"
+    "西班牙|RedIRIS|ftp.rediris.es|https/http|教育网"
+    "西班牙|Universitat de Valencia|mirror.uv.es|https/http|教育网"
+    "俄罗斯|Yandex|mirror.yandex.ru|https/http|商业镜像"
+    "俄罗斯|MSU|mirror.msu.ru|https/http|教育网"
+    "波兰|PSNC|ftp.man.poznan.pl|https/http|教育网"
+    "波兰|Warsaw University|ftp.icm.edu.pl|https/http|教育网"
+    "捷克|CZ.NIC|mirror.nic.cz|https/http|社区镜像"
+    "捷克|Charles University|ftp.cuni.cz|https/http|教育网"
+    "奥地利|Vienna University|mirror.univie.ac.at|https/http|教育网"
+    "比利时|Belnet|ftp.belnet.be|https/http|教育网"
+    "芬兰|FUNET|ftp.funet.fi|https/http|教育网"
+    "芬兰|OSS Planet EU|mirror.eu.ossplanet.net|https/http|社区镜像"
+    "挪威|UiO|ftp.uio.no|https/http|教育网"
+    "丹麦|Dotsrc|mirror.dotsrc.org|https/http|社区镜像"
+    "爱尔兰|HEAnet|ftp.heanet.ie|https/http|教育网"
+    "葡萄牙|FCCN|mirrors.fccn.pt|https/http|教育网"
+    "希腊|University of Crete|ftp.cc.uoc.gr|https/http|教育网"
+    "土耳其|ULAKBIM|mirror.ulakbim.gov.tr|https/http|研究机构"
+)
 
-    # 额外分支
-    for branch in "${extra_branches[@]}"; do
-        sources+="deb ${base_url} ${codename}-${branch} ${components}\n"
-    done
+# 北美洲
+declare -a MIRRORS_NA=(
+    "美国|MIT|mirrors.mit.edu|https/http|教育网"
+    "美国|Stanford|mirrors.stanford.edu|https/http|教育网"
+    "美国|Berkeley|mirrors.berkeley.edu|https/http|教育网"
+    "美国|Princeton|mirror.math.princeton.edu|https/http|教育网"
+    "美国|Columbia|mirror.cc.columbia.edu|https/http|教育网"
+    "美国|UCLA|mirror.claus.ucla.edu|https/http|教育网"
+    "美国|UMass|mirror.cs.umass.edu|https/http|教育网"
+    "美国|Oregon State|ftp.osuosl.org|https/http|开源实验室"
+    "美国|Internet2|mirror.internet2.edu|https/http|科研网络"
+    "美国|Rackspace|mirror.rackspace.com|https/http|商业镜像"
+    "美国|DigitalOcean|mirrors.digitalocean.com|https/http|云服务"
+    "美国|Linux Kernel|mirrors.kernel.org|https/http|官方镜像"
+    "美国|Fremont Cabal|mirror.fcix.net|https/http|社区镜像"
+    "加拿大|UBC|mirror.it.ubc.ca|https/http|教育网"
+    "加拿大|MUUG|muug.ca|https/http|社区镜像"
+    "加拿大|Digital Shape|mirror.dst.ca|https/http|商业镜像"
+)
 
-    # 对于 Debian 8/9 可能还需要处理 -updates, -backports 等，默认 extra_branches 包含 updates, security, backports
-    echo -e "$sources"
-}
+# 大洋洲
+declare -a MIRRORS_OCEANIA=(
+    "澳大利亚|AARNet|mirror.aarnet.edu.au|https/http|教育网"
+    "澳大利亚|Internode|mirror.internode.on.net|https/http|运营商"
+    "澳大利亚|WA Internet|mirror.wai.net.au|https/http|商业镜像"
+    "新西兰|Waikato University|mirror.waikato.ac.nz|https/http|教育网"
+    "新西兰|Auckland University|mirror.auckland.ac.nz|https/http|教育网"
+)
 
-# 生成 RHEL 系仓库文件（.repo）
-generate_rhel_like_repo() {
-    local mirror="$1"
-    local protocol="$2"
-    local releasever="$3"   # 版本号，如 8, 9
-    local components="$4"   # 如 baseos appstream
+# 南美洲
+declare -a MIRRORS_SA=(
+    "巴西|UFSCar|mirror.ufscar.br|https/http|教育网"
+    "巴西|UFPR|mirror.ufpr.br|https/http|教育网"
+    "阿根廷|UNLP|mirrors.unlp.edu.ar|https/http|教育网"
+    "阿根廷|UBA|mirror.uba.ar|https/http|教育网"
+    "智利|Hostednode|mirror.hnd.cl|https/http|商业镜像"
+    "哥伦比亚|FCIX|edgeuno-bog2.mm.fcix.net|https/http|交换中心"
+)
 
-    local distro_path
-    case "$OS_NAME" in
-        centos|rocky|almalinux|oraclelinux|fedora)
-            distro_path="$OS_NAME"
-            ;;
-        rhel)
-            distro_path="rhel"
-            ;;
-        *)
-            distro_path="$OS_NAME"
-            ;;
-    esac
+# 非洲
+declare -a MIRRORS_AFRICA=(
+    "南非|University of Stellenbosch|mirror.sun.ac.za|https/http|教育网"
+    "南非|Dimension Data|mirror.dimensiondata.com|https/http|商业镜像"
+    "肯尼亚|KENET|kenet.ke|https/http|教育网"
+    "埃及|EUN|mirror.eun.eg|https/http|教育网"
+    "摩洛哥|CNRST|mirror.cnrst.ma|https/http|研究机构"
+)
 
-    local base_url="${protocol}://${mirror}/${distro_path}/${releasever}"
-    local repo_content=""
+# ==================== 辅助函数 ====================
 
-    # 对于 RHEL 8/9，典型仓库有 BaseOS, AppStream, EPEL 等
-    # 这里简单生成一个示例，实际应根据发行版和版本调整
-    repo_content="[baseos]
-name=${OS_NAME} \$releasever - BaseOS
-baseurl=${base_url}/BaseOS/\$basearch/os/
-gpgcheck=1
-enabled=1
-
-[appstream]
-name=${OS_NAME} \$releasever - AppStream
-baseurl=${base_url}/AppStream/\$basearch/os/
-gpgcheck=1
-enabled=1
-"
-    # 如果有 EPEL 需求，可额外生成
-    echo "$repo_content"
-}
-
-# 生成 openEuler 等国产发行版
-generate_openeuler_sources() {
-    local mirror="$1"
-    local protocol="$2"
-    local releasever="$3"
-    local components="$4"
-
-    local base_url="${protocol}://${mirror}/openeuler/openEuler-${releasever}"
-    cat <<EOF
-[OS]
-name=OS
-baseurl=${base_url}/OS/\$basearch/
-enabled=1
-gpgcheck=1
-gpgkey=${base_url}/OS/\$basearch/RPM-GPG-KEY-openEuler
-
-[everything]
-name=everything
-baseurl=${base_url}/everything/\$basearch/
-enabled=1
-gpgcheck=1
-gpgkey=${base_url}/everything/\$basearch/RPM-GPG-KEY-openEuler
-
-[EPOL]
-name=EPOL
-baseurl=${base_url}/EPOL/main/\$basearch/
-enabled=1
-gpgcheck=1
-gpgkey=${base_url}/EPOL/main/\$basearch/RPM-GPG-KEY-openEuler
-EOF
-}
-
-# 主函数：运行系统镜像优化（可由菜单调用，也可由命令行参数直接调用）
-run_system_mirror() {
-    log_info "$(_echo "===== System Mirror Optimization =====" "===== 系统镜像优化 =====")"
-    
-    # 如果已经通过命令行参数指定了镜像，则直接使用
-    if [[ -n "$OPT_MIRROR" ]]; then
-        apply_mirror "$OPT_MIRROR" "$OPT_PROTOCOL" "$OPT_BRANCH" "$OPT_COMPONENTS"
-        return $?
-    fi
-
-    # 备份操作
-    if [[ "$OPT_DRY_RUN" == "true" ]]; then
-        _echo "[DRY-RUN] Would backup file: $file" "[模拟运行] 将备份文件：$file"
-    else
-        backup_file "$file" "system_mirror"
-    fi
-
-    # 写入文件
-    if [[ "$OPT_DRY_RUN" == "true" ]]; then
-        _echo "[DRY-RUN] Would write to $file: $content" "[模拟运行] 将写入 $file：$content"
-    else
-        safe_write "$file" "$content" "system_mirror"
-    fi
-
-    # 执行命令（如 apt update）
-    if [[ "$OPT_DRY_RUN" == "true" ]]; then
-        _echo "[DRY-RUN] Would run: apt update" "[模拟运行] 将执行：apt update"
-    else
-        apt update
-    fi
-
-    # 交互式选择
-    _echo "Select mirror source category:" "请选择镜像源类别："
-    echo "1) $(_echo "China Mainland" "中国大陆")"
-    echo "2) $(_echo "Overseas" "海外")"
-    echo "3) $(_echo "Official (restore to default)" "官方源（恢复默认）")"
-    echo "0) $(_echo "Back" "返回")"
-    read -rp "$(_echo "Choice [0-3]: " "请选择 [0-3]：") " cat_choice
-
-    case $cat_choice in
-        1) select_mirror_from_group "china" ;;
-        2) select_mirror_from_group "overseas" ;;
-        3) apply_official_mirror ;;
-        0) return ;;
-        *) _echo "Invalid choice." "无效选择。" ; return ;;
-    esac
-}
-
-# 从指定组中选择镜像站
-select_mirror_from_group() {
-    local group="$1"
-    local -a mirrors
-    local -a names
-    local i=1
-
-    _echo "Available mirrors:" "可用镜像源："
-    for name in "${!MIRROR_STATIONS[@]}"; do
-        local station="${MIRROR_STATIONS[$name]}"
-        # 简单分组：判断是否包含 edu.cn 或特定域名，实际可预先定义分组
-        if [[ "$group" == "china" ]] && [[ "$station" == *".cn" ]]; then
-            mirrors+=("$name")
-            names+=("$name")
-            echo "  $i) $name ($station)"
-            ((i++))
-        elif [[ "$group" == "overseas" ]] && [[ "$station" != *".cn" ]] && [[ -n "$station" ]]; then
-            mirrors+=("$name")
-            names+=("$name")
-            echo "  $i) $name ($station)"
-            ((i++))
+# 获取地区的中英文名称
+get_region_display() {
+    local region="$1"
+    for r in "${REGIONS[@]}"; do
+        IFS='|' read -r code zh_name en_name <<< "$r"
+        if [[ "$code" == "$region" ]]; then
+            if $LANG_ZH; then
+                echo "$zh_name"
+            else
+                echo "$en_name"
+            fi
+            return
         fi
     done
-    echo "  0) $(_echo "Back" "返回")"
-    read -rp "$(_echo "Choice [0-$((i-1))]: " "请选择 [0-$((i-1))]：") " choice
+    echo "$region"
+}
 
-    if [[ "$choice" == "0" ]]; then
-        return
+# 检查镜像是否支持当前发行版
+mirror_supports_distro() {
+    local support_list="$1"
+    local distro="$2"
+    [[ "$support_list" == *"$distro"* ]]
+}
+
+# 获取指定地区的镜像列表（按支持过滤）
+get_mirrors_by_region() {
+    local region="$1"
+    local distro="${OS_NAME}"
+    local -a results=()
+    
+    for mirror in "${GLOBAL_MIRRORS[@]}"; do
+        IFS='|' read -r r country name domain supports <<< "$mirror"
+        if [[ "$r" == "$region" ]] && mirror_supports_distro "$supports" "$distro"; then
+            results+=("$name|$domain|$country")
+        fi
+    done
+    
+    printf '%s\n' "${results[@]}"
+}
+
+# ==================== 核心功能 ====================
+
+# 选择地区（使用硬编码列表）
+select_region() {
+    echo ""
+    _echo "Select region:" "请选择地区："
+    
+    local i=1
+    local -a region_codes=()
+    
+    # 显示所有硬编码地区
+    for region_entry in "${REGIONS[@]}"; do
+        IFS='|' read -r code zh_name en_name <<< "$region_entry"
+        region_codes[$i]="$code"
+        if $LANG_ZH; then
+            echo "  $i) $zh_name"
+        else
+            echo "  $i) $en_name"
+        fi
+        ((i++))
+    done
+    
+    echo "  0) $(_echo "Back" "返回")"
+    read -rp "$(_echo "Choice [0-$((i-1))]: " "请选择 [0-$((i-1))]：") " region_choice
+    
+    if [[ "$region_choice" == "0" ]]; then
+        return 1
     fi
-    if [[ "$choice" -le ${#mirrors[@]} ]]; then
-        local selected_name="${mirrors[$((choice-1))]}"
-        local selected_mirror="${MIRROR_STATIONS[$selected_name]}"
-        apply_mirror "$selected_mirror" "${OPT_PROTOCOL:-https}" "${OPT_BRANCH:-}" "${OPT_COMPONENTS:-}"
+    
+    if [[ "$region_choice" -ge 1 && "$region_choice" -le ${#region_codes[@]} ]]; then
+        echo "${region_codes[$region_choice]}"
     else
         _echo "Invalid choice." "无效选择。"
+        select_region
     fi
 }
 
-# 应用官方源
-apply_official_mirror() {
-    _echo "Restoring official sources..." "正在恢复官方源..."
-    # 根据不同发行版，官方源不需要替换为镜像，可以删除镜像配置或恢复默认备份
-    # 简单起见，我们尝试从备份中恢复
-    if restore_file "/etc/apt/sources.list" || restore_file "/etc/yum.repos.d/"*; then
-        _echo "Official sources restored." "官方源已恢复。"
-    else
-        _echo "No backup found, cannot restore automatically." "未找到备份，无法自动恢复。"
-    fi
-}
-
-# 实际应用镜像源（核心函数）
-apply_mirror() {
-    local mirror="$1"
-    local protocol="$2"
-    local branch="$3"
-    local components="$4"
-    local codename
-    local releasever
-
-    codename=$(get_distro_info)
-    releasever="$OS_VERSION"  # 例如 22.04, 8, 9 等
-
-    if [[ -z "$codename" ]] && [[ "$OS_NAME" =~ ^(debian|ubuntu|linuxmint|raspbian|zorin|deepin|kalilinux|proxmox|armbian|openkylin)$ ]]; then
-        _echo "Unable to get distribution codename, please input manually (e.g., bullseye, focal)." "无法获取发行版代号，请手动输入（例如 bullseye, focal）："
-        read -rp "> " codename
-        if [[ -z "$codename" ]]; then
-            _echo "Operation cancelled." "操作取消。"
-            return 1
+# 从选定地区中选择镜像站
+select_mirror_from_region() {
+    local region_array_name="$1"
+    # 使用 eval 获取整个数组
+    local -a region_mirrors
+    eval "region_mirrors=(\"\${$region_array_name[@]}\")"
+    
+    local i=1
+    _echo "Available mirrors in this region:" "该地区可用的镜像源："
+    
+    local current_country=""
+    for mirror_entry in "${region_mirrors[@]}"; do
+        IFS='|' read -r country name url protocols desc <<< "$mirror_entry"
+        
+        if [[ "$country" != "$current_country" ]]; then
+            current_country="$country"
+            echo ""
+            printf "  ${COLOR_GREEN}== %s ==${COLOR_RESET}\n" "$current_country"
         fi
-    fi
+        
+        printf "%3d) %-20s [%s] %s\n" "$i" "$name" "$protocols" "${desc:+"($desc)"}"
+        ((i++))
+    done
+    
+    echo ""
+    echo "  0) $(_echo "Back to region selection" "返回地区选择")"
+    read -rp "$(_echo "Please select mirror [0-$((i-1))]: " "请选择镜像 [0-$((i-1))]：") " choice
 
-    # 根据发行版类型执行不同的源生成逻辑
+    if [[ "$choice" == "0" ]]; then
+        run_system_mirror
+        return
+    fi
+    
+    if [[ "$choice" -le ${#region_mirrors[@]} ]]; then
+        local selected_entry="${region_mirrors[$((choice-1))]}"
+        IFS='|' read -r country name mirror_url protocols desc <<< "$selected_entry"
+        
+        local protocol="$OPT_PROTOCOL"
+        if [[ "$protocols" == *"https"* && "$protocols" == *"http"* ]]; then
+            echo "$(_echo "Protocol available: https/http" "可用协议：https/http")"
+            read -rp "$(_echo "Use https? (y/n, default y): " "使用 https？(y/n，默认 y)：") " use_https
+            if [[ "$use_https" == "n" || "$use_https" == "N" ]]; then
+                protocol="http"
+            fi
+        fi
+        
+        # 正确调用 apply_mirror：传入域名、名称、协议、分支、组件
+        apply_mirror "$mirror_url" "$name" "$protocol" "$OPT_BRANCH" "$OPT_COMPONENTS"
+    else
+        _echo "Invalid choice." "无效选择。"
+        select_mirror_from_region "$region_array_name"
+    fi
+}
+# 应用镜像源
+apply_mirror() {
+    local mirror_domain="$1"
+    local mirror_name="$2"
+    local protocol="${3:-https}"
+    local branch="${4:-}"
+    local components="${5:-}"
+    
+    _echo "Applying mirror: $mirror_name ($mirror_domain)" "正在应用镜像源：$mirror_name ($mirror_domain)"
+    
+    local codename
+    codename=$(get_distro_codename)
+    local releasever="$OS_VERSION"
+    
     case "$OS_NAME" in
-        debian|ubuntu|linuxmint|raspbian|zorin|deepin|kalilinux|proxmox|armbian|openkylin)
+        debian|ubuntu|linuxmint|raspbian|zorin|deepin|kalilinux)
             local comp="${components:-$(get_default_components)}"
-            local branches
-            if [[ -n "$branch" ]]; then
-                branches=("$branch")
+            local sources_list=""
+            
+            if [[ "$OS_NAME" == "ubuntu" ]]; then
+                sources_list="deb ${protocol}://${mirror_domain}/ubuntu $codename $comp\n"
+                sources_list+="deb ${protocol}://${mirror_domain}/ubuntu ${codename}-updates $comp\n"
+                sources_list+="deb ${protocol}://${mirror_domain}/ubuntu ${codename}-security $comp\n"
+                sources_list+="deb ${protocol}://${mirror_domain}/ubuntu ${codename}-backports $comp\n"
             else
-                # 默认分支：updates, security, backports (取决于发行版)
-                if [[ "$OS_NAME" == "ubuntu" ]]; then
-                    branches=(updates security backports)
-                else
-                    branches=(updates security backports)
-                fi
+                sources_list="deb ${protocol}://${mirror_domain}/debian $codename $comp\n"
+                sources_list+="deb ${protocol}://${mirror_domain}/debian ${codename}-updates $comp\n"
+                sources_list+="deb ${protocol}://${mirror_domain}/debian-security ${codename}-security $comp\n"
+                sources_list+="deb ${protocol}://${mirror_domain}/debian ${codename}-backports $comp\n"
             fi
-            local sources_list
-            sources_list=$(generate_debian_like_sources "$mirror" "$protocol" "$codename" "$comp" "${branches[@]}")
-            # 备份并写入
-            if [[ -f /etc/apt/sources.list ]]; then
-                backup_file /etc/apt/sources.list "system_mirror"
+            
+            if [[ "$OPT_DRY_RUN" == "true" ]]; then
+                _echo "[DRY-RUN] Would write to /etc/apt/sources.list:" "[模拟运行] 将写入 /etc/apt/sources.list："
+                echo -e "$sources_list"
+            else
+                backup_file "/etc/apt/sources.list" "system_mirror"
+                safe_write "/etc/apt/sources.list" "$sources_list" "system_mirror"
+                _echo "APT sources updated. Running apt update..." "APT 源已更新，正在更新软件包列表..."
+                apt update
             fi
-            safe_write /etc/apt/sources.list "$sources_list" "system_mirror"
-            _echo "APT sources updated. Running apt update..." "APT 源已更新，正在更新软件包列表..."
-            apt update
             ;;
+            
         centos|rocky|almalinux|oraclelinux|fedora|rhel)
             local repo_dir="/etc/yum.repos.d"
-            local releasever_major="${releasever%%.*}"  # 取主版本号
-            local repo_content
-            repo_content=$(generate_rhel_like_repo "$mirror" "$protocol" "$releasever_major" "${components:-$(get_default_components)}")
-            # 备份原有 repo 文件（可选）
-            backup_file "$repo_dir" "system_mirror"  # 备份整个目录？通常逐个文件备份
-            # 写入新的 repo 文件，注意不要覆盖原有的 epel 等
-            safe_write "$repo_dir/${OS_NAME}.repo" "$repo_content" "system_mirror"
-            _echo "YUM/DNF sources updated. Running update..." "YUM/DNF 源已更新，正在更新..."
-            if command -v dnf &>/dev/null; then
-                dnf makecache
+            local releasever_major="${releasever%%.*}"
+            local repo_content=""
+            
+            repo_content="[baseos]\n"
+            repo_content+="name=${OS_NAME} \$releasever - BaseOS\n"
+            repo_content+="baseurl=${protocol}://${mirror_domain}/${OS_NAME}/\$releasever/BaseOS/\$basearch/os/\n"
+            repo_content+="gpgcheck=1\n"
+            repo_content+="enabled=1\n\n"
+            repo_content+="[appstream]\n"
+            repo_content+="name=${OS_NAME} \$releasever - AppStream\n"
+            repo_content+="baseurl=${protocol}://${mirror_domain}/${OS_NAME}/\$releasever/AppStream/\$basearch/os/\n"
+            repo_content+="gpgcheck=1\n"
+            repo_content+="enabled=1\n"
+            
+            if [[ "$OPT_DRY_RUN" == "true" ]]; then
+                _echo "[DRY-RUN] Would write to $repo_dir/${OS_NAME}.repo:" "[模拟运行] 将写入 $repo_dir/${OS_NAME}.repo："
+                echo -e "$repo_content"
             else
-                yum makecache
+                backup_file "$repo_dir/${OS_NAME}.repo" "system_mirror"
+                safe_write "$repo_dir/${OS_NAME}.repo" "$repo_content" "system_mirror"
+                _echo "YUM/DNF sources updated. Running makecache..." "YUM/DNF 源已更新，正在更新缓存..."
+                if command -v dnf &>/dev/null; then
+                    dnf makecache
+                else
+                    yum makecache
+                fi
             fi
             ;;
-        openeuler|opencloudos)
-            local repo_content
-            repo_content=$(generate_openeuler_sources "$mirror" "$protocol" "$releasever" "${components:-$(get_default_components)}")
-            backup_file "/etc/yum.repos.d/${OS_NAME}.repo" "system_mirror"
-            safe_write "/etc/yum.repos.d/${OS_NAME}.repo" "$repo_content" "system_mirror"
-            dnf makecache
+            
+        arch)
+            local mirrorlist="/etc/pacman.d/mirrorlist"
+            local server_line="Server = ${protocol}://${mirror_domain}/\$repo/os/\$arch"
+            
+            if [[ "$OPT_DRY_RUN" == "true" ]]; then
+                _echo "[DRY-RUN] Would add to $mirrorlist:" "[模拟运行] 将添加到 $mirrorlist："
+                echo "$server_line"
+            else
+                backup_file "$mirrorlist" "system_mirror"
+                echo "$server_line" | cat - "$mirrorlist" > "${mirrorlist}.tmp"
+                mv "${mirrorlist}.tmp" "$mirrorlist"
+                _echo "Pacman mirror updated. Running pacman -Sy..." "Pacman 源已更新，正在刷新..."
+                pacman -Sy
+            fi
             ;;
+            
         *)
             _echo "Unsupported distribution: $OS_NAME" "不支持的发行版：$OS_NAME"
             return 1
             ;;
     esac
-
-    log_info "$(_echo "Mirror applied: $mirror" "已应用镜像：$mirror")"
+    
+    log_info "$(_echo "Mirror applied: $mirror_name ($mirror_domain)" "已应用镜像源：$mirror_name ($mirror_domain)")"
 }
 
-# 导出函数供主脚本调用
+# 官方源恢复
+apply_official_mirror() {
+    _echo "Restoring official sources..." "正在恢复官方源..."
+    
+    case "$PKG_MANAGER" in
+        apt)
+            if restore_file "/etc/apt/sources.list"; then
+                apt update
+            fi
+            ;;
+        dnf|yum)
+            if restore_file "/etc/yum.repos.d/"*; then
+                if command -v dnf &>/dev/null; then
+                    dnf makecache
+                else
+                    yum makecache
+                fi
+            fi
+            ;;
+        pacman)
+            if restore_file "/etc/pacman.d/mirrorlist"; then
+                pacman -Sy
+            fi
+            ;;
+        *)
+            _echo "No backup found for official sources." "未找到官方源备份。"
+            ;;
+    esac
+}
+
+# 颜色定义（如果 common.sh 未提供）
+if [[ -z "$COLOR_GREEN" ]]; then
+    COLOR_GREEN='\033[0;32m'
+    COLOR_RESET='\033[0m'
+fi
+
+# ==================== 主函数 ====================
+
+run_system_mirror() {
+    log_info "$(_echo "===== System Mirror Optimization =====" "===== 系统镜像优化 =====")"
+
+    # 如果已经通过命令行参数指定了镜像，则直接使用
+    if [[ -n "$OPT_MIRROR" ]]; then
+        apply_mirror "$OPT_MIRROR" "$OPT_MIRROR" "$OPT_PROTOCOL" "$OPT_BRANCH" "$OPT_COMPONENTS"
+        return $?
+    fi
+
+    # 先选择地区大类
+    _echo "Select region:" "请选择地区："
+    echo "1) $(_echo "Asia (China)" "亚洲（中国）")"
+    echo "2) $(_echo "Asia (Other)" "亚洲（其他国家和地区）")"
+    echo "3) $(_echo "Europe" "欧洲")"
+    echo "4) $(_echo "North America" "北美洲")"
+    echo "5) $(_echo "South America" "南美洲")"
+    echo "6) $(_echo "Oceania" "大洋洲")"
+    echo "7) $(_echo "Africa" "非洲")"
+    echo "8) $(_echo "Back to main menu" "返回主菜单")"
+    read -rp "$(_echo "Choice [1-8]: " "请选择 [1-8]：") " region_choice
+
+    case $region_choice in
+        1) select_mirror_from_region "MIRRORS_ASIA_CHINA" ;;
+        2) select_mirror_from_region "MIRRORS_ASIA_OTHER" ;;
+        3) select_mirror_from_region "MIRRORS_EUROPE" ;;
+        4) select_mirror_from_region "MIRRORS_NA" ;;
+        5) select_mirror_from_region "MIRRORS_SA" ;;
+        6) select_mirror_from_region "MIRRORS_OCEANIA" ;;
+        7) select_mirror_from_region "MIRRORS_AFRICA" ;;
+        8) return ;;
+        *) _echo "Invalid choice." "无效选择。" ; run_system_mirror ;;
+    esac
+}

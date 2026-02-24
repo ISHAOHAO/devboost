@@ -25,7 +25,6 @@ REQUIRED_MODULES=(
 
 # 判断是否在管道执行（远程模式）
 is_pipe_execution() {
-    # 如果 $0 包含 /dev/fd/ 或标准输入不是终端，则认为是在管道执行
     [[ "$0" == *"/dev/fd/"* ]] || [[ ! -t 0 ]]
 }
 
@@ -46,7 +45,6 @@ download_file() {
 # 远程模式：创建临时目录并下载所有必要文件
 setup_remote_environment() {
     echo "检测到远程执行模式，正在准备环境..."
-    # 创建临时目录
     TEMP_DIR=$(mktemp -d -t devboost.XXXXXX)
     export DEVBOOST_ROOT="$TEMP_DIR"
     export DEVBOOST_BACKUP_DIR="$TEMP_DIR/backups"
@@ -54,18 +52,15 @@ setup_remote_environment() {
     export DEVBOOST_LOG_FILE="$DEVBOOST_LOG_DIR/devboost.log"
     export DEVBOOST_MANIFEST="$DEVBOOST_BACKUP_DIR/manifest.txt"
 
-    # 创建必要的子目录
     mkdir -p "$DEVBOOST_ROOT/lib" "$DEVBOOST_ROOT/modules" \
              "$DEVBOOST_BACKUP_DIR" "$DEVBOOST_LOG_DIR"
 
-    # 下载 lib 文件
     for lib in "${REQUIRED_LIBS[@]}"; do
         local filename=$(basename "$lib")
         echo "下载 $lib ..."
         download_file "$GITHUB_RAW_BASE/$lib" "$DEVBOOST_ROOT/lib/$filename"
     done
 
-    # 下载 modules 文件
     for mod in "${REQUIRED_MODULES[@]}"; do
         local filename=$(basename "$mod")
         echo "下载 $mod ..."
@@ -73,15 +68,13 @@ setup_remote_environment() {
     done
 
     echo "环境准备完成，临时目录: $TEMP_DIR"
-    # 注册退出时清理临时目录
     trap 'rm -rf "$TEMP_DIR"' EXIT
 }
 
-# 确定项目根目录（必须在加载任何库之前执行）
+# 确定项目根目录
 if is_pipe_execution; then
     setup_remote_environment
 else
-    # 本地执行模式：使用脚本所在目录
     SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
     export DEVBOOST_ROOT="$SCRIPT_DIR"
     export DEVBOOST_BACKUP_DIR="$DEVBOOST_ROOT/backups"
@@ -90,7 +83,7 @@ else
     export DEVBOOST_MANIFEST="$DEVBOOST_BACKUP_DIR/manifest.txt"
 fi
 
-# 现在 DEVBOOST_ROOT 已确定，加载公共库
+# 加载公共库
 source "$DEVBOOST_ROOT/lib/common.sh"
 
 # ---------- 全局变量 ----------
@@ -104,7 +97,20 @@ OPT_LANG="en"
 OPT_DRY_RUN=false
 
 # ---------- 函数定义 ----------
-# 初始化环境（创建目录、检测系统）
+
+# 询问用户选择语言
+ask_language() {
+    echo "Please select language / 请选择语言:"
+    echo "1) English"
+    echo "2) 中文"
+    read -rp "Choice [1-2]: " lang_choice
+    case "$lang_choice" in
+        2) OPT_LANG="zh" ;;
+        *) OPT_LANG="en" ;;
+    esac
+}
+
+# 初始化环境
 init_environment() {
     mkdir -p "$DEVBOOST_BACKUP_DIR" "$DEVBOOST_LOG_DIR"
     touch "$DEVBOOST_LOG_FILE"
@@ -114,16 +120,14 @@ init_environment() {
     log_info "日志文件: $DEVBOOST_LOG_FILE"
     log_info "备份目录: $DEVBOOST_BACKUP_DIR"
 
-    # 设置语言环境变量（供模块使用）
     export DEVBOOST_LANG="$OPT_LANG"
 
-    # 加载系统检测结果
     source "$DEVBOOST_ROOT/lib/detect.sh"
     detect_system
     log_info "系统信息: OS=$OS_NAME, ENV=$ENV_TYPE, PKG_MGR=$PKG_MANAGER, NETWORK=$NETWORK_STATUS"
 }
 
-# 显示主菜单（交互模式）
+# 显示主菜单
 show_menu() {
     echo ""
     if [[ "$OPT_LANG" == "zh" ]]; then
@@ -150,9 +154,7 @@ show_menu() {
     done < <(discover_modules)
 
     local module_count=${#module_names[@]}
-    # 添加“全部执行”选项
     echo "$((module_count+1))) $(_echo "Run All" "全部执行")"
-    # 添加“退出”选项
     echo "0) $(_echo "Exit" "退出")"
     echo "========================================"
     read -rp "$(_echo "Please select [0-$((module_count+1))]: " "请选择 [0-$((module_count+1))]：") " choice
@@ -181,11 +183,9 @@ run_module() {
 
     log_info "开始运行模块: $module"
     
-    # 导出 OPT_* 变量，供模块使用
     export OPT_MIRROR OPT_PROTOCOL OPT_BRANCH OPT_COMPONENTS
 
     source "$module_script"
-    # 每个模块必须实现 run_${module} 函数
     if declare -f "run_${module}" >/dev/null; then
         "run_${module}"
     else
@@ -321,6 +321,11 @@ done
 
 # ---------- 主流程 ----------
 main() {
+    # 交互模式下，如果没有指定语言且非自动确认，则询问语言
+    if [[ -z "$SPECIFIC_MODULE" && "$OPT_LANG" == "en" && "$AUTO_CONFIRM" == false ]]; then
+        ask_language
+    fi
+
     init_environment
 
     if [[ "$SPECIFIC_MODULE" == "rollback" ]]; then
