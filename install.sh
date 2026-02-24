@@ -7,7 +7,29 @@ set -euo pipefail
 # 支持 Linux / macOS / WSL
 # ==================================================
 
-SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+# 获取脚本真实路径（兼容管道执行和本地执行）
+if [[ "${BASH_SOURCE[0]}" != "${0}" ]]; then
+    SCRIPT_PATH="${BASH_SOURCE[0]}"
+else
+    SCRIPT_PATH="$0"
+fi
+
+if [[ -f "$SCRIPT_PATH" ]]; then
+    SCRIPT_DIR="$(cd "$(dirname "$SCRIPT_PATH")" && pwd)"
+else
+    # 管道执行，尝试使用当前目录作为项目根目录
+    SCRIPT_DIR="$(pwd)"
+    # 检查当前目录是否包含必要的子目录
+    if [[ ! -d "$SCRIPT_DIR/lib" || ! -d "$SCRIPT_DIR/modules" ]]; then
+        echo "错误：无法自动确定项目根目录。"
+        echo "请先使用 git clone 克隆项目，然后在项目目录内执行："
+        echo "  git clone https://github.com/ISHAOHAO/devboost.git"
+        echo "  cd devboost"
+        echo "  ./install.sh"
+        exit 1
+    fi
+fi
+
 export DEVBOOST_ROOT="$SCRIPT_DIR"
 export DEVBOOST_BACKUP_DIR="$DEVBOOST_ROOT/backups"
 export DEVBOOST_LOG_DIR="$DEVBOOST_ROOT/logs"
