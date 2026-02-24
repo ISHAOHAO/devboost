@@ -1,0 +1,68 @@
+name: CI
+
+on:
+  push:
+    branches: [ main, master ]
+  pull_request:
+    branches: [ main, master ]
+
+jobs:
+  shellcheck:
+    name: ShellCheck
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Run ShellCheck
+        run: |
+          sudo apt-get update && sudo apt-get install -y shellcheck
+          shellcheck install.sh lib/*.sh modules/*.sh
+
+  test-on-distros:
+    name: Test on ${{ matrix.distro }}
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        distro:
+          - ubuntu:20.04
+          - ubuntu:22.04
+          - ubuntu:24.04
+          - debian:10
+          - debian:11
+          - debian:12
+          - centos:7
+          - centos:8
+          - rockylinux:8
+          - rockylinux:9
+          - fedora:38
+          - fedora:39
+          - fedora:40
+          - archlinux:latest
+    container:
+      image: ${{ matrix.distro }}
+      options: --privileged
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install dependencies
+        run: |
+          if command -v apt-get >/dev/null 2>&1; then
+            apt-get update && apt-get install -y sudo curl bash
+          elif command -v yum >/dev/null 2>&1; then
+            yum install -y sudo curl bash
+          elif command -v dnf >/dev/null 2>&1; then
+            dnf install -y sudo curl bash
+          elif command -v pacman >/dev/null 2>&1; then
+            pacman -Sy --noconfirm sudo curl bash
+          fi
+      - name: Make scripts executable
+        run: chmod +x install.sh lib/*.sh modules/*.sh
+      - name: Test help and dry-run
+        run: |
+          ./install.sh --help
+          # 以 dry-run 模式运行系统镜像优化（不实际修改）
+          ./install.sh --system-mirror --mirror aliyun --dry-run
+      - name: Test system detection
+        run: |
+          source lib/detect.sh
+          detect_system
+          echo "OS: $OS_NAME, PKG: $PKG_MANAGER"
