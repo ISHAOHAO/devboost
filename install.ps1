@@ -50,10 +50,26 @@ $AUTO_CONFIRM = $yes
 $OPT_LANG = $lang
 $OPT_DRY_RUN = $dryrun
 
-# 日志目录
-$scriptRoot = Split-Path -Parent $MyInvocation.MyCommand.Definition
-$logDir = Join-Path $scriptRoot "logs"
-$backupDir = Join-Path $scriptRoot "backups"
+# 确定工作目录（兼容远程执行）
+function Get-WorkingDirectory {
+    # 尝试获取脚本真实路径
+    $scriptPath = $MyInvocation.MyCommand.Definition
+    if (Test-Path -LiteralPath $scriptPath -PathType Leaf) {
+        # 本地执行，使用脚本所在目录
+        return Split-Path -Parent $scriptPath
+    } else {
+        # 远程执行，使用临时目录
+        $tempDir = Join-Path $env:TEMP "devboost"
+        if (-not (Test-Path $tempDir)) {
+            New-Item -ItemType Directory -Path $tempDir -Force | Out-Null
+        }
+        return $tempDir
+    }
+}
+
+$DEVBOOST_ROOT = Get-WorkingDirectory
+$logDir = Join-Path $DEVBOOST_ROOT "logs"
+$backupDir = Join-Path $DEVBOOST_ROOT "backups"
 $logFile = Join-Path $logDir "devboost.log"
 $manifestFile = Join-Path $backupDir "manifest.txt"
 
@@ -71,7 +87,7 @@ function Write-Log {
     else { Write-Host $line -ForegroundColor Green }
 }
 
-# 多语言输出（用于单行纯文本）
+# 多语言输出
 function Write-I18n {
     param([string]$en, [string]$zh)
     if ($OPT_LANG -eq "zh") { Write-Host $zh }
@@ -110,20 +126,39 @@ function Confirm-Action {
     return ($answer -eq "y" -or $answer -eq "Y")
 }
 
-# 备份文件
+# 备份文件（支持注册表路径）
 function Backup-File {
     param([string]$Path, [string]$Tag)
     if (-not (Test-Path $Path)) { return $null }
+
     $timestamp = Get-Date -Format "yyyyMMdd_HHmmss"
-    $backupPath = Join-Path $backupDir "$(Split-Path $Path -Leaf)_${Tag}_$timestamp"
-    Copy-Item -Path $Path -Destination $backupPath
+    if ($Path -match '^registry::') {
+        # 注册表项：导出为 .reg 文件
+        $regPath = $Path -replace '^registry::', ''
+        $backupPath = Join-Path $backupDir "$(($regPath -replace '\\', '_') -replace ':', '')_${Tag}_$timestamp.reg"
+        if ($OPT_DRY_RUN) {
+            Write-Log "INFO" "[DRY-RUN] Would export registry $regPath to $backupPath"
+        } else {
+            reg export "$regPath" "$backupPath" /y > $null 2>&1
+            Write-Log "INFO" "Registry exported: $regPath -> $backupPath"
+        }
+    } else {
+        # 普通文件
+        $backupPath = Join-Path $backupDir "$(Split-Path $Path -Leaf)_${Tag}_$timestamp"
+        if ($OPT_DRY_RUN) {
+            Write-Log "INFO" "[DRY-RUN] Would copy $Path to $backupPath"
+        } else {
+            Copy-Item -Path $Path -Destination $backupPath
+            Write-Log "INFO" "Backup created: $Path -> $backupPath"
+        }
+    }
+
     $manifestLine = "$Path|$backupPath|$Tag|$timestamp"
     Add-Content -Path $manifestFile -Value $manifestLine
-    Write-Log "INFO" "Backup created: $Path -> $backupPath"
     return $backupPath
 }
 
-# 恢复文件
+# 恢复文件（简化，此处仅用于演示，实际需根据类型处理）
 function Restore-File {
     param([string]$OriginalPath)
     if (-not (Test-Path $manifestFile)) { return $false }
@@ -147,7 +182,12 @@ function Restore-File {
     $backupPath = $parts[1]
 
     if (Test-Path $backupPath) {
-        Copy-Item -Path $backupPath -Destination $OriginalPath -Force
+        if ($OriginalPath -match '^registry::') {
+            # 注册表项：导入 .reg 文件
+            reg import "$backupPath" > $null 2>&1
+        } else {
+            Copy-Item -Path $backupPath -Destination $OriginalPath -Force
+        }
         Write-Log "INFO" "Restored: $OriginalPath"
         return $true
     }
@@ -212,7 +252,10 @@ function Optimize-DNS {
         if ($OPT_DRY_RUN) {
             Write-Log "INFO" "[DRY-RUN] Would set DNS on $($adapter.Name) to $($servers -join ', ')"
         } else {
-            Backup-File -Path "registry::HKLM\SYSTEM\CurrentControlSet\Services\Tcpip\Parameters\Interfaces\$($adapter.InterfaceGuid)" -Tag "dns"
+            # 备份注册表项
+            $regPath = "registry::HKLM\SYSTEM\CurrentControlSet\Services\Tcpip\Parameters\Interfaces\$($adapter.InterfaceGuid)"
+            Backup-File -Path $regPath -Tag "dns"
+            # 设置 DNS
             Set-DnsClientServerAddress -InterfaceIndex $adapter.ifIndex -ServerAddresses $servers
             Write-Log "INFO" "DNS set on $($adapter.Name) to $($servers -join ', ')"
         }
@@ -224,35 +267,35 @@ function Optimize-DevTools {
 
     # npm
     if (Get-Command npm -ErrorAction SilentlyContinue) {
-        Write-I18n "npm installed, current registry:" "npm 已安装，当前 registry：" (npm config get registry)
+        Write-Host "npm 已安装，当前 registry: $(npm config get registry)"
         if (Confirm-Action "Configure npm mirror?" "配置 npm 镜像？") {
             $registry = "https://registry.npmmirror.com"
             if ($OPT_DRY_RUN) {
                 Write-Log "INFO" "[DRY-RUN] npm config set registry $registry"
             } else {
                 npm config set registry $registry
-                Write-Log "INFO" "npm registry set to $registry"
+                Write-Log "INFO" "npm registry 已设置为 $registry"
             }
         }
     }
 
     # pip
     if (Get-Command pip -ErrorAction SilentlyContinue) {
-        Write-I18n "pip installed" "pip 已安装"
+        Write-Host "pip 已安装"
         if (Confirm-Action "Configure pip mirror?" "配置 pip 镜像？") {
             $indexUrl = "https://pypi.tuna.tsinghua.edu.cn/simple"
             if ($OPT_DRY_RUN) {
                 Write-Log "INFO" "[DRY-RUN] pip config set global.index-url $indexUrl"
             } else {
                 pip config set global.index-url $indexUrl
-                Write-Log "INFO" "pip index-url set to $indexUrl"
+                Write-Log "INFO" "pip index-url 已设置为 $indexUrl"
             }
         }
     }
 
     # Docker
     if (Get-Command docker -ErrorAction SilentlyContinue) {
-        Write-I18n "Docker installed" "Docker 已安装"
+        Write-Host "Docker 已安装"
         $daemonPath = "$env:ProgramData\Docker\config\daemon.json"
         if (Confirm-Action "Configure Docker mirror?" "配置 Docker 镜像加速器？") {
             $mirror = "https://docker.mirrors.ustc.edu.cn"
@@ -270,7 +313,7 @@ function Optimize-DevTools {
                 $config.'registry-mirrors' += $mirror
                 Backup-File -Path $daemonPath -Tag "docker"
                 $config | ConvertTo-Json -Depth 10 | Set-Content $daemonPath
-                Write-Log "INFO" "Docker mirror added: $mirror"
+                Write-Log "INFO" "Docker 镜像加速器已添加: $mirror"
                 Restart-Service docker
             }
         }
@@ -315,7 +358,7 @@ function Optimize-GitHubHosts {
     } else {
         Backup-File -Path $hostsPath -Tag "github"
         Add-Content -Path $hostsPath -Value "`r`n$entries"
-        Write-Log "INFO" "GitHub hosts updated"
+        Write-Log "INFO" "GitHub hosts 已更新"
     }
 }
 
@@ -324,13 +367,13 @@ function Optimize-GitHubProxy {
     if (-not $proxy) { return }
     [Environment]::SetEnvironmentVariable("http_proxy", $proxy, "User")
     [Environment]::SetEnvironmentVariable("https_proxy", $proxy, "User")
-    Write-Log "INFO" "Proxy environment variables set. Restart shell to take effect."
+    Write-Log "INFO" "代理环境变量已设置，重新打开命令行生效。"
 }
 
 function Invoke-Rollback {
     Write-Log "INFO" "===== 回滚 ====="
     if (-not (Test-Path $manifestFile)) {
-        Write-Log "WARN" "No backup records found." "未找到备份记录。"
+        Write-Log "WARN" "未找到备份记录。"
         return
     }
     $lines = Get-Content $manifestFile
@@ -340,8 +383,8 @@ function Invoke-Rollback {
         Write-Host "$i. $($parts[0])  ->  $($parts[1])  ($($parts[2]))"
         $i++
     }
-    Write-Host "0. Cancel" "0. 取消"
-    $choice = Read-Host "Select number to rollback"
+    Write-Host "0. 取消"
+    $choice = Read-Host "选择要回滚的序号"
     if ($choice -eq "0") { return }
     if ($choice -match '^\d+$' -and $choice -le $lines.Count) {
         $selected = $lines[$choice-1]
@@ -349,10 +392,14 @@ function Invoke-Rollback {
         $backupPath = $parts[1]
         $original = $parts[0]
         if (Test-Path $backupPath) {
-            Copy-Item -Path $backupPath -Destination $original -Force
-            Write-Log "INFO" "Restored: $original"
+            if ($original -match '^registry::') {
+                reg import "$backupPath" > $null 2>&1
+            } else {
+                Copy-Item -Path $backupPath -Destination $original -Force
+            }
+            Write-Log "INFO" "已恢复: $original"
         } else {
-            Write-Log "ERROR" "Backup file missing: $backupPath"
+            Write-Log "ERROR" "备份文件丢失: $backupPath"
         }
     } else {
         Write-I18n "Invalid choice." "无效选择。"
@@ -393,9 +440,9 @@ function Show-Menu {
 }
 
 function Main {
-    Write-Log "INFO" "========== devboost (Windows) started =========="
-    Write-Log "INFO" "Log file: $logFile"
-    Write-Log "INFO" "Backup directory: $backupDir"
+    Write-Log "INFO" "========== devboost (Windows) 启动 =========="
+    Write-Log "INFO" "日志文件: $logFile"
+    Write-Log "INFO" "备份目录: $backupDir"
 
     # 交互模式下询问语言（如果没有通过参数指定且为默认英文）
     if (-not $dns -and -not $devtools -and -not $github -and -not $rollback -and $OPT_LANG -eq "en") {
@@ -403,7 +450,7 @@ function Main {
     }
 
     $sysInfo = Get-SystemInfo
-    Write-Log "INFO" "System: $($sysInfo.OSName) $($sysInfo.OSVersion), WSL=$($sysInfo.IsWSL)"
+    Write-Log "INFO" "系统信息: $($sysInfo.OSName) $($sysInfo.OSVersion), WSL=$($sysInfo.IsWSL)"
 
     if ($rollback) {
         Invoke-Rollback
